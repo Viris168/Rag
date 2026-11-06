@@ -27,6 +27,7 @@ tokenizer = embedder.tokenizer
 # chunk can never exceed what the model reads (MiniLM: 256 incl. [CLS]/[SEP]).
 CHUNK_TOKENS = 200
 OVERLAP_TOKENS = 40
+TOP_K = 6  # chunks sent to the LLM; 6 beat 4 on eval.py (multi-section hit 40% -> 60%)
 assert CHUNK_TOKENS + 2 <= embedder.max_seq_length
 
 
@@ -35,19 +36,19 @@ def n_tokens(text):
     return len(tokenizer(text)["input_ids"])
 
 
-def chunk(text, max_tokens=CHUNK_TOKENS, overlap=OVERLAP_TOKENS):
+def chunk_spans(words, max_tokens=CHUNK_TOKENS, overlap=OVERLAP_TOKENS):
+    """(start, end) word ranges, each at most max_tokens, overlapping by ~overlap."""
     # The tokenizer splits on spaces before splitting words into pieces,
     # so per-word token counts add up exactly to the chunk's token count.
-    words = text.split()
     cost = [len(tokenizer.tokenize(w)) for w in words]
-    chunks, start = [], 0
+    spans, start = [], 0
     while start < len(words):
         end, total = start, 0
         while end < len(words) and total + cost[end] <= max_tokens:
             total += cost[end]
             end += 1
         end = max(end, start + 1)          # a single giant "word" still makes progress
-        chunks.append(" ".join(words[start:end]))
+        spans.append((start, end))
         if end == len(words):
             break
         # Step back so the next chunk repeats ~`overlap` tokens of this one.
@@ -56,7 +57,7 @@ def chunk(text, max_tokens=CHUNK_TOKENS, overlap=OVERLAP_TOKENS):
             back -= 1
             carried += cost[back]
         start = back
-    return chunks
+    return spans
 
 
 def doc_files():
@@ -64,21 +65,29 @@ def doc_files():
 
 
 def load(path):
-    """Yield (source label, text) pairs: one per PDF page, one per text file."""
-    if path.suffix.lower() == ".pdf":
-        pages = PdfReader(path).pages
-        empty = 0
-        for n, page in enumerate(pages, 1):
-            text = page.extract_text() or ""
-            if text.strip():
-                yield f"{path.name} p.{n}", text
-            else:
-                empty += 1
-        if empty:
-            print(f"warning: {path.name}: {empty}/{len(pages)} pages have no text "
-                  f"(scanned images need OCR first)", file=sys.stderr)
-    else:
-        yield path.name, path.read_text(encoding="utf-8")
+    """Words of the file, and the page each word is on (None for text files)."""
+    if path.suffix.lower() != ".pdf":
+        words = path.read_text(encoding="utf-8").split()
+        return words, [None] * len(words)
+    pages = PdfReader(path).pages
+    words, page_of, empty = [], [], 0
+    for n, page in enumerate(pages, 1):
+        w = (page.extract_text() or "").split()
+        if not w:
+            empty += 1
+        words += w
+        page_of += [n] * len(w)
+    if empty:
+        print(f"warning: {path.name}: {empty}/{len(pages)} pages have no text "
+              f"(scanned images need OCR first)", file=sys.stderr)
+    return words, page_of
+
+
+def label(name, first, last):
+    """'TP3.pdf p.3', or 'TP3.pdf p.3-4' for a chunk that runs across a page break."""
+    if first is None:
+        return name
+    return f"{name} p.{first}" if first == last else f"{name} p.{first}-{last}"
 
 
 # --- Indexing (cached; rebuilt when a doc is added, removed or changed) ---
@@ -88,7 +97,7 @@ def build_index():
         sys.exit(f"No .txt or .pdf files found in {DOCS_DIR}")
     mtimes = {str(p): p.stat().st_mtime for p in files}
     settings = {"model": EMBED_MODEL, "chunk_tokens": CHUNK_TOKENS,
-                "overlap_tokens": OVERLAP_TOKENS}
+                "overlap_tokens": OVERLAP_TOKENS, "across_pages": True}
     if INDEX_FILE.exists():
         cached = pickle.loads(INDEX_FILE.read_bytes())
         if cached["mtimes"] == mtimes and cached.get("settings") == settings:
@@ -97,10 +106,12 @@ def build_index():
     print(f"Indexing {len(files)} file(s)...", file=sys.stderr)
     chunks, sources = [], []
     for path in files:
-        for label, text in load(path):
-            for c in chunk(text):
-                chunks.append(c)
-                sources.append(label)
+        # Chunk the whole file as one stream so sections split by a page break
+        # stay together; the label records every page a chunk covers.
+        words, page_of = load(path)
+        for start, end in chunk_spans(words):
+            chunks.append(" ".join(words[start:end]))
+            sources.append(label(path.name, page_of[start], page_of[end - 1]))
     if not chunks:
         sys.exit("No text could be extracted from the documents.")
     vecs = embedder.encode(chunks, normalize_embeddings=True)  # shape (N, d)
@@ -125,14 +136,14 @@ def get_client():
 
 
 # --- Querying ---
-def retrieve(question, k=4):
+def retrieve(question, k=TOP_K):
     q = embedder.encode([question], normalize_embeddings=True)[0]
     scores = vecs @ q                      # cosine similarity (vectors normalized)
     top = np.argsort(-scores)[:k]
     return [(int(i), float(scores[i])) for i in top]
 
 
-def ask(question, k=4, show=False):
+def ask(question, k=TOP_K, show=False):
     hits = retrieve(question, k)
     if show:
         print("--- retrieved chunks ---")
@@ -140,8 +151,12 @@ def ask(question, k=4, show=False):
             print(f"[{i}] score={score:.2f} ({sources[i]}) {chunks[i][:150]}...")
         print("------------------------\n")
     context = "\n\n".join(f"[{i}] ({sources[i]}) {chunks[i]}" for i, _ in hits)
-    prompt = (f"Answer using only the context below. Cite chunk numbers. "
-              f"If the answer isn't there, say so.\n\n{context}\n\nQuestion: {question}")
+    prompt = (f"Answer using only the context below, and cite the chunk numbers you used. "
+              f"If any chunk contains the answer, give it directly, even if the chunk "
+              f"words it differently from the question. If no chunk addresses the "
+              f"question, reply with only: \"That isn't in the document.\" Never add "
+              f"that sentence to an answer.\n\n"
+              f"{context}\n\nQuestion: {question}")
     resp = get_client().chat.completions.create(
         model=CHAT_MODEL, max_tokens=800,
         messages=[{"role": "user", "content": prompt}])
