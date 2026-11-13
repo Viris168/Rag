@@ -3,17 +3,19 @@
 #   python eval.py --retrieval-only -> retrieval scores only, no API calls
 #   python eval.py -k 4 -v          -> top-4 retrieval (default rag.TOP_K), print every answer
 #
-# Retrieval, per answerable question (a "relevant" chunk covers an expected page;
-# a chunk can span a page break, e.g. "p.3-4"):
+# Retrieval, per answerable question. A chunk is "relevant" if it contains one of the
+# question's "evidence" strings (exact text from the PDF, compared ignoring case and
+# whitespace), so the score doesn't depend on how chunks line up with pages.
+# Questions without "evidence" fall back to matching their expected "pages".
 #   hit@k  - a relevant chunk is in the top k. Questions with "need_all" need every
-#            expected page in the top k (the answer is spread across sections).
+#            evidence string in the top k (the answer is spread across sections).
 #   hit@1  - the top chunk is relevant.
 #   MRR    - mean of 1/rank of the first relevant chunk (0 if none in top k).
-#   hit@1 and MRR skip "need_all" questions, where no single page is the answer.
+#   hit@1 and MRR skip "need_all" questions, where no single chunk is the answer.
 # Refusal accuracy: unanswerable questions should get "not in the document".
 # False refusals: answerable questions the model wrongly refused. Reported so that
 #   a model that refuses everything can't score 100% on refusal accuracy.
-# Citations: of the answered questions, how many cite a chunk from an expected page.
+# Citations: of the answered questions, how many cite a relevant chunk.
 #
 # Each question has an optional "kind" (direct / paraphrase / multi / near-miss);
 # the summary breaks scores down by kind.
@@ -64,6 +66,37 @@ def pages_of(source):
     return set(range(int(first), int(last or first) + 1))
 
 
+def norm(text):
+    return " ".join(text.replace("\u2019", "'").split()).lower()
+
+
+NORM_CHUNKS = [norm(c) for c in rag.chunks]
+
+
+def relevant(i, item):
+    """Does chunk i hold (part of) the answer to this question?"""
+    if "evidence" in item:
+        return any(norm(e) in NORM_CHUNKS[i] for e in item["evidence"])
+    return bool(pages_of(rag.sources[i]) & set(item["pages"]))
+
+
+def retrieval_hit(ids, item):
+    if not item.get("need_all"):
+        return any(relevant(i, item) for i in ids)
+    if "evidence" in item:
+        return all(any(norm(e) in NORM_CHUNKS[i] for i in ids) for e in item["evidence"])
+    return set(item["pages"]) <= set().union(*(pages_of(rag.sources[i]) for i in ids))
+
+
+def check_evidence(answerable):
+    """Warn about evidence strings no chunk contains (typo, or split by a chunk edge)."""
+    bad = [(item["q"], e) for item in answerable for e in item.get("evidence", [])
+           if not any(norm(e) in c for c in NORM_CHUNKS)]
+    for q, e in bad:
+        print(f"warning: evidence not in any chunk: {e!r}  ({q})", file=sys.stderr)
+    return not bad
+
+
 def main():
     args = sys.argv[1:]
     k = int(args[args.index("-k") + 1]) if "-k" in args else rag.TOP_K
@@ -71,6 +104,7 @@ def main():
     verbose = "-v" in args
     data = json.loads(EVAL_FILE.read_text(encoding="utf-8"))
     answerable, unanswerable = data["answerable"], data["unanswerable"]
+    check_evidence(answerable)
     # by_kind[kind][metric] = [score, count]
     by_kind = defaultdict(lambda: defaultdict(lambda: [0, 0]))
 
@@ -81,21 +115,18 @@ def main():
 
     print(f"=== Retrieval (top {k}) ===")
     for item in answerable:
-        want = item["pages"]
-        got = [pages_of(rag.sources[i]) for i, _ in rag.retrieve(item["q"], k)]
-        if item.get("need_all"):
-            hit = set(want) <= set().union(*got)
-        else:
-            hit = any(g & set(want) for g in got)
-        rank = next((r for r, g in enumerate(got, 1) if g & set(want)), None)
+        ids = [i for i, _ in rag.retrieve(item["q"], k)]
+        hit = retrieval_hit(ids, item)
+        rank = next((r for r, i in enumerate(ids, 1) if relevant(i, item)), None)
         tally(item, "hit@k", hit)
         if not item.get("need_all"):     # rank of "the" right page is meaningless here
             tally(item, "hit@1", rank == 1)
             tally(item, "mrr", 1 / rank if rank else 0)
         tag = "HIT " if hit else "MISS"
-        shown = ", ".join(f"{min(g)}-{max(g)}" if len(g) > 1 else str(min(g, default="?"))
-                          for g in got)
-        print(f"{tag} want p.{want}{' (all)' if item.get('need_all') else ''} "
+        # "*" marks the retrieved chunks that contain evidence
+        shown = ", ".join(rag.sources[i].rpartition(" p.")[2] + ("*" if relevant(i, item) else "")
+                          for i in ids)
+        print(f"{tag} want p.{item['pages']}{' (all)' if item.get('need_all') else ''} "
               f"got p.[{shown}]  {item['q']}")
 
     if not retrieval_only:
@@ -118,7 +149,7 @@ def main():
             tally(item, "false_refusal", refused)
             cited = cited_chunks(answer)
             cited_pages = sorted(set().union(*(pages_of(rag.sources[i]) for i in cited)))
-            cite_ok = any(p in item["pages"] for p in cited_pages)
+            cite_ok = any(relevant(i, item) for i in cited)
             if not refused:
                 tally(item, "citation", cite_ok)
             problem = ("REFUSED" if refused else
